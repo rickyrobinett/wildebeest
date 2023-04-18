@@ -12,7 +12,13 @@ import { useDomain } from './useDomain'
  * @param account the target account or null
  * @returns url to be used for the target account (or undefined if)
  */
-export function useAccountUrl(account: Pick<Account, 'id' | 'url'> | null) {
+export function useAccountUrl(
+	account: (Partial<Pick<Account, 'id'>> & Pick<Account, 'url'>) | null
+): string | undefined {
+	if (!account?.id) {
+		return account?.url
+	}
+
 	const isLocal = useAccountIsLocal(account?.id)
 
 	if (account && isLocal.value) {
@@ -32,7 +38,7 @@ function useAccountIsLocal(accountId: string | undefined) {
 
 		if (accountId) {
 			const handle = parseHandle(accountId)
-			isLocal.value = handle.domain === null || (handle.domain !== null && handle.domain === domain)
+			isLocal.value = handle.domain === null || handle.domain === domain
 		}
 	})
 

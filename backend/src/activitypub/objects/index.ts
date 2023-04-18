@@ -1,5 +1,6 @@
 import type { UUID } from 'wildebeest/backend/src/types'
 import { addPeer } from 'wildebeest/backend/src/activitypub/peers'
+import { type Database } from 'wildebeest/backend/src/database'
 
 export const originalActorIdSymbol = Symbol()
 export const originalObjectIdSymbol = Symbol()
@@ -39,7 +40,7 @@ export function uri(domain: string, id: string): URL {
 
 export async function createObject<Type extends APObject>(
 	domain: string,
-	db: D1Database,
+	db: Database,
 	type: string,
 	properties: any,
 	originalActorId: URL,
@@ -86,7 +87,7 @@ type CacheObjectRes = {
 
 export async function cacheObject(
 	domain: string,
-	db: D1Database,
+	db: Database,
 	properties: unknown,
 	originalActorId: URL,
 	originalObjectId: URL,
@@ -94,7 +95,7 @@ export async function cacheObject(
 ): Promise<CacheObjectRes> {
 	const sanitizedProperties = await sanitizeObjectProperties(properties)
 
-	const cachedObject = await getObjectBy(db, 'original_object_id', originalObjectId.toString())
+	const cachedObject = await getObjectBy(db, ObjectByKey.originalObjectId, originalObjectId.toString())
 	if (cachedObject !== null) {
 		return {
 			created: false,
@@ -127,7 +128,15 @@ export async function cacheObject(
 	}
 
 	{
-		const properties = JSON.parse(row.properties)
+		let properties
+		if (typeof row.properties === 'object') {
+			// neon uses JSONB for properties which is returned as a deserialized
+			// object.
+			properties = row.properties
+		} else {
+			// D1 uses a string for JSON properties
+			properties = JSON.parse(row.properties)
+		}
 		const object = {
 			published: new Date(row.cdate).toISOString(),
 			...properties,
@@ -144,7 +153,7 @@ export async function cacheObject(
 	}
 }
 
-export async function updateObject(db: D1Database, properties: any, id: URL): Promise<boolean> {
+export async function updateObject(db: Database, properties: any, id: URL): Promise<boolean> {
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	const res: any = await db
 		.prepare('UPDATE objects SET properties = ? WHERE id = ?')
@@ -156,9 +165,9 @@ export async function updateObject(db: D1Database, properties: any, id: URL): Pr
 	return true
 }
 
-export async function updateObjectProperty(db: D1Database, obj: APObject, key: string, value: string) {
+export async function updateObjectProperty(db: Database, obj: APObject, key: string, value: string) {
 	const { success, error } = await db
-		.prepare(`UPDATE objects SET properties=json_set(properties, '$.${key}', ?) WHERE id=?`)
+		.prepare(`UPDATE objects SET properties=${db.qb.jsonSet('properties', key, '?1')} WHERE id=?2`)
 		.bind(value, obj.id.toString())
 		.run()
 	if (!success) {
@@ -166,24 +175,35 @@ export async function updateObjectProperty(db: D1Database, obj: APObject, key: s
 	}
 }
 
-export async function getObjectById(db: D1Database, id: string | URL): Promise<APObject | null> {
-	return getObjectBy(db, 'id', id.toString())
+export async function getObjectById(db: Database, id: string | URL): Promise<APObject | null> {
+	return getObjectBy(db, ObjectByKey.id, id.toString())
 }
 
-export async function getObjectByOriginalId(db: D1Database, id: string | URL): Promise<APObject | null> {
-	return getObjectBy(db, 'original_object_id', id.toString())
+export async function getObjectByOriginalId(db: Database, id: string | URL): Promise<APObject | null> {
+	return getObjectBy(db, ObjectByKey.originalObjectId, id.toString())
 }
 
-export async function getObjectByMastodonId(db: D1Database, id: UUID): Promise<APObject | null> {
-	return getObjectBy(db, 'mastodon_id', id)
+export async function getObjectByMastodonId(db: Database, id: UUID): Promise<APObject | null> {
+	return getObjectBy(db, ObjectByKey.mastodonId, id)
 }
 
-export async function getObjectBy(db: D1Database, key: string, value: string) {
+export enum ObjectByKey {
+	id = 'id',
+	originalObjectId = 'original_object_id',
+	mastodonId = 'mastodon_id',
+}
+
+const allowedObjectByKeysSet = new Set(Object.values(ObjectByKey))
+
+export async function getObjectBy(db: Database, key: ObjectByKey, value: string) {
+	if (!allowedObjectByKeysSet.has(key)) {
+		throw new Error('getObjectBy run with invalid key: ' + key)
+	}
 	const query = `
-SELECT *
-FROM objects
-WHERE objects.${key}=?
-  `
+		SELECT *
+		FROM objects
+		WHERE objects.${key}=?
+	`
 	const { results, success, error } = await db.prepare(query).bind(value).all()
 	if (!success) {
 		throw new Error('SQL error: ' + error)
@@ -194,7 +214,15 @@ WHERE objects.${key}=?
 	}
 
 	const result: any = results[0]
-	const properties = JSON.parse(result.properties)
+	let properties
+	if (typeof result.properties === 'object') {
+		// neon uses JSONB for properties which is returned as a deserialized
+		// object.
+		properties = result.properties
+	} else {
+		// D1 uses a string for JSON properties
+		properties = JSON.parse(result.properties)
+	}
 
 	return {
 		published: new Date(result.cdate).toISOString(),
@@ -226,7 +254,7 @@ export async function sanitizeObjectProperties(properties: unknown): Promise<APO
 		sanitized.content = await sanitizeContent(properties.content as string)
 	}
 	if ('name' in properties) {
-		sanitized.name = await sanitizeName(properties.name as string)
+		sanitized.name = await getTextContent(properties.name as string)
 	}
 	return sanitized
 }
@@ -245,12 +273,12 @@ export async function sanitizeContent(unsafeContent: string): Promise<string> {
 }
 
 /**
- * Sanitizes given string as an ActivityPub Object name.
- *
- * This sanitization removes all HTML elements from the string leaving only the text content.
+ * This method removes all HTML elements from the string leaving only the text content.
  */
-export async function sanitizeName(unsafeName: string): Promise<string> {
-	return await getNameRewriter().transform(new Response(unsafeName)).text()
+export async function getTextContent(unsafeName: string): Promise<string> {
+	const rawContent = getTextContentRewriter().transform(new Response(unsafeName))
+	const text = await rawContent.text()
+	return text.trim()
 }
 
 function getContentRewriter() {
@@ -258,7 +286,8 @@ function getContentRewriter() {
 	contentRewriter.on('*', {
 		element(el) {
 			if (!['p', 'span', 'br', 'a'].includes(el.tagName)) {
-				el.tagName = 'p'
+				const element = el as { tagName: string }
+				element.tagName = 'p'
 			}
 
 			if (el.hasAttribute('class')) {
@@ -273,20 +302,23 @@ function getContentRewriter() {
 	return contentRewriter
 }
 
-function getNameRewriter() {
-	const nameRewriter = new HTMLRewriter()
-	nameRewriter.on('*', {
+function getTextContentRewriter() {
+	const textContentRewriter = new HTMLRewriter()
+	textContentRewriter.on('*', {
 		element(el) {
 			el.removeAndKeepContent()
+			if (['p', 'br'].includes(el.tagName)) {
+				el.after(' ')
+			}
 		},
 	})
-	return nameRewriter
+	return textContentRewriter
 }
 
 // TODO: eventually use SQLite's `ON DELETE CASCADE` but requires writing the DB
 // schema directly into D1, which D1 disallows at the moment.
 // Some context at: https://stackoverflow.com/questions/13150075/add-on-delete-cascade-behavior-to-an-sqlite3-table-after-it-has-been-created
-export async function deleteObject<T extends APObject>(db: D1Database, note: T) {
+export async function deleteObject<T extends APObject>(db: Database, note: T) {
 	const nodeId = note.id.toString()
 	const batch = [
 		db.prepare('DELETE FROM outbox_objects WHERE object_id=?').bind(nodeId),
@@ -296,6 +328,7 @@ export async function deleteObject<T extends APObject>(db: D1Database, note: T) 
 		db.prepare('DELETE FROM actor_reblogs WHERE object_id=?').bind(nodeId),
 		db.prepare('DELETE FROM actor_replies WHERE object_id=?1 OR in_reply_to_object_id=?1').bind(nodeId),
 		db.prepare('DELETE FROM idempotency_keys WHERE object_id=?').bind(nodeId),
+		db.prepare('DELETE FROM note_hashtags WHERE object_id=?').bind(nodeId),
 		db.prepare('DELETE FROM objects WHERE id=?').bind(nodeId),
 	]
 

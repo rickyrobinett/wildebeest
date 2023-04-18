@@ -1,115 +1,59 @@
-import { component$, useStyles$ } from '@builder.io/qwik'
+import { $, component$ } from '@builder.io/qwik'
+import { getDatabase } from 'wildebeest/backend/src/database'
 import { loader$ } from '@builder.io/qwik-city'
-import { MastodonAccount } from 'wildebeest/backend/src/types'
-import StickyHeader from '~/components/StickyHeader/StickyHeader'
-import { formatDateTime } from '~/utils/dateTime'
-import { formatRoundedNumber } from '~/utils/numbers'
-import styles from '../../../utils/innerHtmlContent.scss?inline'
-import { getAccount } from 'wildebeest/backend/src/accounts/getAccount'
-import { getNotFoundHtml } from '~/utils/getNotFoundHtml/getNotFoundHtml'
 import { getErrorHtml } from '~/utils/getErrorHtml/getErrorHtml'
+import type { MastodonStatus } from '~/types'
+import { StatusesPanel } from '~/components/StatusesPanel/StatusesPanel'
+import { getLocalStatuses } from 'wildebeest/functions/api/v1/accounts/[id]/statuses'
+import { parseHandle } from 'wildebeest/backend/src/utils/parse'
 
-export const accountLoader = loader$<{ DATABASE: D1Database }, Promise<MastodonAccount>>(
-	async ({ platform, request, html }) => {
-		let account: MastodonAccount | null = null
-		try {
-			const url = new URL(request.url)
-			const domain = url.hostname
-			const accountId = url.pathname.split('/')[1]
+export const statusesLoader = loader$<
+	Promise<{
+		accountId: string
+		statuses: MastodonStatus[]
+	}>
+>(async ({ platform, request, html }) => {
+	let statuses: MastodonStatus[] = []
+	let accountId = ''
+	try {
+		const url = new URL(request.url)
+		accountId = url.pathname.split('/')[1]
 
-			account = await getAccount(domain, accountId, platform.DATABASE)
-		} catch {
-			throw html(
-				500,
-				getErrorHtml(`An error happened when trying to retrieve the account's details, please try again later`)
-			)
-		}
-
-		if (!account) {
-			throw html(404, getNotFoundHtml())
-		}
-		return account
+		const handle = parseHandle(accountId)
+		accountId = handle.localPart
+		const response = await getLocalStatuses(request as Request, await getDatabase(platform), handle, 0, false)
+		statuses = await response.json<Array<MastodonStatus>>()
+	} catch {
+		throw html(
+			500,
+			getErrorHtml(`An error happened when trying to retrieve the account's statuses, please try again later`)
+		)
 	}
-)
+
+	return { accountId, statuses: JSON.parse(JSON.stringify(statuses)) }
+})
 
 export default component$(() => {
-	useStyles$(styles)
-
-	const accountDetails = accountLoader.use().value
-
-	const fields = [
-		{
-			name: 'Joined',
-			value: formatDateTime(accountDetails.created_at, false),
-		},
-		...accountDetails.fields,
-	]
-
-	const stats = [
-		{
-			name: 'Posts',
-			value: formatRoundedNumber(accountDetails.statuses_count),
-		},
-		{
-			name: 'Following',
-			value: formatRoundedNumber(accountDetails.following_count),
-		},
-		{
-			name: 'Followers',
-			value: formatRoundedNumber(accountDetails.followers_count),
-		},
-	]
-
-	const accountDomain = getAccountDomain(accountDetails)
+	const { accountId, statuses } = statusesLoader().value
 
 	return (
-		<div>
-			<StickyHeader withBackButton />
-			<div class="relative mb-16">
-				<img
-					src={accountDetails.header}
-					alt={`Header of ${accountDetails.display_name}`}
-					class="w-full h-40 object-cover bg-wildebeest-500"
-				/>
-				<img
-					class="rounded h-24 w-24 absolute bottom-[-3rem] left-5 border-2 border-wildebeest-600"
-					src={accountDetails.avatar}
-					alt={`Avatar of ${accountDetails.display_name}`}
-				/>
-			</div>
-			<div class="px-5">
-				<h2 class="font-bold">{accountDetails.display_name}</h2>
-				<span class="block my-1 text-wildebeest-400">
-					@{accountDetails.acct}
-					{accountDomain && `@${accountDomain}`}
-				</span>
-				<div class="inner-html-content my-5" dangerouslySetInnerHTML={accountDetails.note} />
-				<dl class="mb-6 flex flex-col bg-wildebeest-800 border border-wildebeest-600 rounded-md">
-					{fields.map(({ name, value }) => (
-						<div class="border-b border-wildebeest-600 p-3 text-sm" key={name}>
-							<dt class="uppercase font-semibold text-wildebeest-500 opacity-80 mb-1">{name}</dt>
-							<dd class="inner-html-content opacity-80 text-wildebeest-200" dangerouslySetInnerHTML={value}></dd>
-						</div>
-					))}
-				</dl>
-				<div data-testid="stats" class="pb-4 flex flex-wrap gap-5">
-					{stats.map(({ name, value }) => (
-						<div class="flex gap-1" key={name}>
-							<span class="font-semibold">{value}</span>
-							<span class="text-wildebeest-500">{name}</span>
-						</div>
-					))}
-				</div>
-			</div>
+		<div data-testid="account-posts">
+			<StatusesPanel
+				initialStatuses={statuses}
+				fetchMoreStatuses={$(async (numOfCurrentStatuses: number) => {
+					let statuses: MastodonStatus[] = []
+					try {
+						const response = await fetch(`/api/v1/accounts/${accountId}/statuses?offset=${numOfCurrentStatuses}`)
+						if (response.ok) {
+							const results = await response.text()
+							statuses = JSON.parse(results)
+						}
+					} catch {
+						/* empty */
+					}
+					return statuses
+				})}
+			/>
 		</div>
 	)
 })
-
-export function getAccountDomain(account: MastodonAccount): string | null {
-	try {
-		const url = new URL(account.url)
-		return url.hostname || null
-	} catch {
-		return null
-	}
-}
